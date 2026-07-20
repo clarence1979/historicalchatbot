@@ -1,0 +1,6 @@
+/*
+  Strict-Transport-Security: max-age=63072000; includeSubDomains; preload
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: strict-origin-when-cross-origin
+  Permissions-Policy: camera=(), microphone=(), geolocation=()
+  Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https://oaidalleapiprodscus.blob.core.windows.net https://images.pexels.com https://*.paypalobjects.com https://*.paypal.com; connect-src 'self' https://husmauixxwicqfegkqmy.supabase.co; media-src 'self' blob:; worker-src blob:; font-src 'self' data:; frame-ancestors https://teachingtools.dev https://www.teachingtools.dev; form-action 'self'; base-uri 'self';
