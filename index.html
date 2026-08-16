@@ -602,6 +602,391 @@ video.cam{width:100%;height:20rem;object-fit:cover;background:#000;border-radius
 (function(){
 "use strict";
 
+/* ===============================================================
+   0. EMBED COMPATIBILITY LAYER
+   ---------------------------------------------------------------
+   This app is often opened as a window inside another app: an
+   <iframe> in a launcher, a desktop shell, a portal page, a
+   Cowork/Electron wrapper. Four things break in that situation,
+   and all four are handled here so every provider — Ollama
+   included — keeps working:
+
+     1. STORAGE. A sandboxed or partitioned frame makes
+        localStorage throw on the very first touch, which used to
+        kill the script before boot. pickStorage() falls back to
+        the host's storage (when the parent is same origin) and
+        then to memory, so the app always starts.
+
+     2. TRANSPORT. A frame with an opaque origin sends
+        "Origin: null", which Ollama rejects unless OLLAMA_ORIGINS
+        allows it; a parent CSP can block connect-src outright.
+        dvFetch() tries the direct call first and, if the network
+        layer refuses, asks the host page to make the call and
+        relay the answer back over postMessage.
+
+     3. RUNTIME. WebGPU, the camera and the microphone are all
+        gated on a secure context and on iframe permissions.
+        We detect this and say exactly which attribute is missing
+        instead of failing with a vague error.
+
+     4. CONFIG. A host can hand down the Ollama URL, the provider
+        and the shared key vault, either through the URL hash or
+        through a postMessage, so a frame with no usable storage
+        still starts up already configured.
+
+   HOST SIDE. None of this is required — the app degrades
+   gracefully — but a host that wants Ollama to work from inside a
+   sandboxed frame should embed the app like this:
+
+     <iframe src="index.html"
+             sandbox="allow-scripts allow-same-origin allow-downloads
+                      allow-popups allow-forms allow-modals"
+             allow="camera; microphone; clipboard-write">
+     </iframe>
+
+   and paste the bridge listener printed by AI setup -> "Running
+   inside another app" -> "Copy host bridge" into the host page.
+   =============================================================== */
+
+const EMBED = (()=>{
+  let framed=false, sameOriginTop=false, org='null';
+  try{ framed = window.self !== window.top; }catch(e){ framed = true; }
+  try{ sameOriginTop = framed ? (typeof window.top.location.href === 'string') : true; }
+  catch(e){ sameOriginTop = false; }
+  try{ org = window.origin || location.origin || 'null'; }catch(e){ org='null'; }
+  return {
+    framed,
+    sameOriginTop,
+    origin: org,
+    opaque: (org==='null'),
+    secure: !!window.isSecureContext,
+    proto: location.protocol,
+    storageVia: 'own',      // own | host | memory
+    bridge: false,          // true once a host answers the handshake
+    relayed: false          // true once a request has actually gone via the host
+  };
+})();
+
+/** Read a setting the host may have pinned to the URL: ?ollama=... or #ollama=... */
+function embedParam(name){
+  try{
+    const q=new URLSearchParams(location.search);
+    if(q.has(name)) return String(q.get(name)||'').trim();
+  }catch(e){}
+  try{
+    const h=new URLSearchParams(String(location.hash||'').replace(/^#/,''));
+    if(h.has(name)) return String(h.get(name)||'').trim();
+  }catch(e){}
+  return '';
+}
+
+/* ---------------- storage that cannot throw ---------------- */
+function memoryStorage(){
+  const m=new Map();
+  return {
+    get length(){ return m.size; },
+    key(i){ const k=Array.from(m.keys()); return i<k.length?k[i]:null; },
+    getItem(k){ k=String(k); return m.has(k)?m.get(k):null; },
+    setItem(k,v){ m.set(String(k), String(v)); },
+    removeItem(k){ m.delete(String(k)); },
+    clear(){ m.clear(); }
+  };
+}
+function usable(store){
+  const probe='__dv_probe__';
+  store.setItem(probe,'1');
+  const ok = store.getItem(probe)==='1';
+  store.removeItem(probe);
+  if(!ok) throw new Error('storage is read only');
+  return store;
+}
+function pickStorage(kind){
+  try{ return usable(window[kind]); }catch(e){}
+  try{ if(EMBED.sameOriginTop){ const s=usable(window.top[kind]); EMBED.storageVia='host'; return s; } }catch(e){}
+  EMBED.storageVia='memory';
+  return memoryStorage();
+}
+/* These shadow the globals for the whole app. Every existing call
+   site keeps its familiar spelling and simply stops throwing. */
+const localStorage   = pickStorage('localStorage');
+const sessionStorage = pickStorage('sessionStorage');
+
+/* ---------------- host bridge (postMessage RPC) ---------------- */
+const nativeFetch = (typeof window.fetch==='function') ? window.fetch.bind(window) : null;
+
+const HOST = (()=>{
+  const pending=new Map();
+  let seq=0, ready=false, sentHello=false, waiters=[];
+  const inbox=[];                       // config messages that arrive before boot
+
+  function post(msg){
+    try{ (window.parent||window.top).postMessage(msg,'*'); return true; }catch(e){ return false; }
+  }
+
+  window.addEventListener('message', ev=>{
+    const d=ev.data;
+    if(!d || typeof d!=='object' || typeof d.dv!=='string') return;
+
+    if(d.dv==='ready'){
+      ready=true; EMBED.bridge=true;
+      waiters.splice(0).forEach(fn=>fn(true));
+      return;
+    }
+    if(d.dv==='config'){ inbox.push(d); applyHostConfig(d); return; }
+    if(d.dv==='fetch-result'){
+      const p=pending.get(d.id);
+      if(!p) return;
+      pending.delete(d.id); clearTimeout(p.timer);
+      if(d.error) p.reject(new Error(String(d.error)));
+      else p.resolve(buildResponse(d));
+    }
+  });
+
+  function buildResponse(d){
+    let body=null;
+    if(typeof d.bodyBase64==='string'){
+      const bin=atob(d.bodyBase64), arr=new Uint8Array(bin.length);
+      for(let i=0;i<bin.length;i++) arr[i]=bin.charCodeAt(i);
+      body=arr;
+    }else if(typeof d.bodyText==='string'){
+      body=d.bodyText;
+    }
+    const status=d.status||200;
+    const init={ status, statusText:d.statusText||'', headers:d.headers||{} };
+    try{ return new Response((status===204||status===205||status===304)?null:body, init); }
+    catch(e){
+      // Very old engine: hand back something the app can still read.
+      const text = (typeof d.bodyText==='string') ? d.bodyText : '';
+      return {
+        ok: status>=200 && status<300, status, statusText:init.statusText,
+        headers:{ get:k=>(d.headers||{})[String(k).toLowerCase()]||null },
+        text:async()=>text, json:async()=>JSON.parse(text||'null'),
+        blob:async()=>new Blob([body||text]), arrayBuffer:async()=>new Blob([body||text]).arrayBuffer()
+      };
+    }
+  }
+
+  function hello(){
+    if(sentHello || !EMBED.framed) return;
+    sentHello=true;
+    post({ dv:'hello', app:'historical-figures-ai-chat', v:1 });
+  }
+
+  let absent=false;              // a handshake has already gone unanswered
+  function waitReady(ms){
+    if(ready) return Promise.resolve(true);
+    if(!EMBED.framed) return Promise.resolve(false);
+    // Do not pay the handshake wait again on every later call.
+    if(absent && !ms) return Promise.resolve(false);
+    if(ms){ absent=false; sentHello=false; }   // an explicit retry asks again
+    hello();
+    return new Promise(res=>{
+      waiters.push(res);
+      setTimeout(()=>{
+        const i=waiters.indexOf(res);
+        if(i>=0) waiters.splice(i,1);
+        if(!ready) absent=true;
+        res(ready);
+      }, ms||700);
+    });
+  }
+
+  async function relay(url, init, ms){
+    if(!(await waitReady())) throw new Error('No host bridge is listening.');
+    init = init||{};
+    const headers = {};
+    try{
+      if(init.headers){
+        if(typeof init.headers.forEach==='function') init.headers.forEach((v,k)=>{ headers[k]=v; });
+        else Object.keys(init.headers).forEach(k=>{ headers[k]=init.headers[k]; });
+      }
+    }catch(e){}
+    const body = (typeof init.body==='string') ? init.body : (init.body==null?null:String(init.body));
+    const id='dv'+(++seq)+'.'+Date.now();
+
+    return new Promise((resolve,reject)=>{
+      const timer=setTimeout(()=>{
+        pending.delete(id);
+        reject(new Error('The host did not answer in time.'));
+      }, ms||60000);
+      pending.set(id,{resolve,reject,timer});
+
+      if(init.signal){
+        if(init.signal.aborted){
+          clearTimeout(timer); pending.delete(id);
+          return reject(new DOMException('Aborted','AbortError'));
+        }
+        init.signal.addEventListener('abort',()=>{
+          const p=pending.get(id);
+          if(!p) return;
+          pending.delete(id); clearTimeout(p.timer);
+          p.reject(new DOMException('Aborted','AbortError'));
+        },{once:true});
+      }
+
+      const sent = post({ dv:'fetch', id, url,
+        method:(init.method||'GET').toUpperCase(), headers, body });
+      if(!sent){
+        clearTimeout(timer); pending.delete(id);
+        reject(new Error('Cannot talk to the host page.'));
+      }
+    });
+  }
+
+  return { hello, waitReady, relay, get ready(){ return ready; }, get inbox(){ return inbox; } };
+})();
+
+/** Settings the host pushed down: Ollama URL, provider, shared keys. */
+let _appReady=false;              // flipped in boot(), once S and PROVIDERS exist
+let _pendingHostConfig=null;
+function applyHostConfig(cfg){
+  if(!cfg || typeof cfg!=='object') return;
+  if(!_appReady){ _pendingHostConfig=cfg; return; }   // arrived before state exists
+  try{
+    if(cfg.ollamaUrl) S.ai.ollamaUrl=String(cfg.ollamaUrl).replace(/\/+$/,'');
+    if(cfg.provider && PROVIDERS[cfg.provider]){ S.ai.provider=cfg.provider; S.ai.pinned=true; }
+    if(cfg.keys && typeof cfg.keys==='object'){
+      for(const p of ['openai','anthropic','gemini'])
+        if(typeof cfg.keys[p]==='string' && cfg.keys[p]) S.ai.keys[p]=cfg.keys[p].trim();
+      KeyVault.write(S.ai.keys);
+    }
+    if(typeof updateAIStatus==='function') updateAIStatus();
+  }catch(e){}
+}
+
+/* ---------------- transport ---------------- */
+const RELAY_ORIGINS = new Set();     // origins already proven unreachable directly
+
+function originOf(u){
+  try{ return new URL(u, location.href).origin; }catch(e){ return String(u); }
+}
+function isNetworkFailure(err){
+  // A CORS rejection, a blocked mixed-content request, a sandbox veto and a
+  // dead server all surface as the same opaque TypeError.
+  return !!err && (err.name==='TypeError' || /network|failed to fetch|load failed/i.test(err.message||''));
+}
+
+/**
+ * fetch() for embedded life. Direct first; the host relays only when the
+ * direct call is refused at the network layer, so nothing changes when the
+ * app is opened normally.
+ */
+async function dvFetch(input, init){
+  const url = (typeof input==='string') ? input
+            : (input && typeof input.url==='string') ? input.url : String(input);
+  const org = originOf(url);
+
+  if(EMBED.framed && RELAY_ORIGINS.has(org) && HOST.ready){
+    try{ return await HOST.relay(url, init); }catch(e){ /* fall through and retry directly */ }
+  }
+  if(!nativeFetch) return HOST.relay(url, init);
+
+  try{
+    return await nativeFetch(input, init);
+  }catch(err){
+    if(EMBED.framed && isNetworkFailure(err) && !(init && init.signal && init.signal.aborted)){
+      try{
+        const r = await HOST.relay(url, init);
+        RELAY_ORIGINS.add(org);
+        EMBED.relayed = true;
+        return r;
+      }catch(e2){ /* no bridge, or the host could not reach it either */ }
+    }
+    throw err;
+  }
+}
+const fetch = dvFetch;
+
+/* ---------------- what is blocked, and how to unblock it ---------------- */
+function embedReport(){
+  const out={ framed:EMBED.framed, problems:[], notes:[] };
+  if(!EMBED.framed) return out;
+
+  if(EMBED.opaque)
+    out.problems.push({
+      what:'This frame has no origin of its own, so it is not a secure context.',
+      why:'WebGPU, the camera and the microphone are switched off, and Ollama sees the request as coming from "null".',
+      fix:'Add allow-same-origin to the iframe sandbox attribute.'
+    });
+  else if(!EMBED.secure && EMBED.proto!=='file:')
+    out.problems.push({
+      what:'This frame is not a secure context.',
+      why:'WebLLM cannot use WebGPU here.',
+      fix:'Serve the host page over https, or open it from file://.'
+    });
+
+  if(EMBED.storageVia==='memory')
+    out.problems.push({
+      what:'Storage is blocked in this frame.',
+      why:'Keys and saved sessions last only until the window closes.',
+      fix:'Add allow-same-origin to the sandbox attribute, or have the host push the keys down with a config message.'
+    });
+  else if(EMBED.storageVia==='host')
+    out.notes.push('Settings are being written to the host page\u2019s storage, so the shared key vault still works.');
+
+  if(!navigator.gpu)
+    out.notes.push('No WebGPU in this frame, so WebLLM is unavailable. Ollama and the cloud providers are unaffected.');
+
+  if(!navigator.mediaDevices)
+    out.notes.push('No camera or microphone here. Add allow="camera; microphone" to the iframe.');
+
+  if(EMBED.bridge) out.notes.push('A host bridge is listening'+(EMBED.relayed?' and is relaying requests.':'.'));
+  else out.notes.push('No host bridge is listening. If Ollama cannot be reached directly, paste the bridge into the host page.');
+
+  return out;
+}
+
+/** The listener a host page pastes in to relay calls this frame cannot make. */
+const HOST_BRIDGE_SNIPPET =
+"<script>\n"+
+"(function(){\n"+
+"  var ALLOW = [\n"+
+"    'http://localhost:11434', 'http://127.0.0.1:11434',\n"+
+"    'https://api.openai.com', 'https://api.anthropic.com',\n"+
+"    'https://generativelanguage.googleapis.com'\n"+
+"  ];\n"+
+"  var CONFIG = { ollamaUrl:'http://localhost:11434' };   // optional: add keys:{openai:'...'}\n"+
+"  function allowed(u){ try{ return ALLOW.indexOf(new URL(u).origin) >= 0; }catch(e){ return false; } }\n"+
+"  window.addEventListener('message', function(ev){\n"+
+"    var d = ev.data, frame = ev.source;\n"+
+"    if(!d || typeof d !== 'object' || typeof d.dv !== 'string' || !frame) return;\n"+
+"\n"+
+"    if(d.dv === 'hello'){\n"+
+"      frame.postMessage({ dv:'ready' }, '*');\n"+
+"      frame.postMessage(Object.assign({ dv:'config' }, CONFIG), '*');\n"+
+"      return;\n"+
+"    }\n"+
+"    if(d.dv !== 'fetch') return;\n"+
+"\n"+
+"    if(!allowed(d.url)){\n"+
+"      frame.postMessage({ dv:'fetch-result', id:d.id, error:'Blocked by the host allow list.' }, '*');\n"+
+"      return;\n"+
+"    }\n"+
+"    fetch(d.url, { method:d.method || 'GET', headers:d.headers || {}, body:d.body || undefined })\n"+
+"      .then(function(r){\n"+
+"        var h = {}; r.headers.forEach(function(v,k){ h[k] = v; });\n"+
+"        var ct = h['content-type'] || '';\n"+
+"        var textish = /json|text|xml|javascript|urlencoded|event-stream/i.test(ct) || !ct;\n"+
+"        var done = function(extra){\n"+
+"          frame.postMessage(Object.assign({ dv:'fetch-result', id:d.id, status:r.status,\n"+
+"            statusText:r.statusText, headers:h }, extra), '*');\n"+
+"        };\n"+
+"        if(textish) return r.text().then(function(t){ done({ bodyText:t }); });\n"+
+"        /* Audio and images come back as bytes, so send them base64 encoded. */\n"+
+"        return r.arrayBuffer().then(function(buf){\n"+
+"          var b = new Uint8Array(buf), s = '', CH = 0x8000;\n"+
+"          for(var i = 0; i < b.length; i += CH) s += String.fromCharCode.apply(null, b.subarray(i, i + CH));\n"+
+"          done({ bodyBase64: btoa(s) });\n"+
+"        });\n"+
+"      })\n"+
+"      .catch(function(e){\n"+
+"        frame.postMessage({ dv:'fetch-result', id:d.id, error:String(e && e.message || e) }, '*');\n"+
+"      });\n"+
+"  });\n"+
+"})();\n"+
+"<\/script>";
+
+
 /* ---------------------------------------------------------------
    1. Constants
    --------------------------------------------------------------- */
@@ -906,7 +1291,7 @@ const S = {
     chain:'',              // which rung of the fallback ladder we landed on
     chainNote:'',          // plain-language reason, shown in AI setup
     webllm:{ engine:null, loadedModel:'', loading:false, progress:0, text:'' },
-    showKey:{}, probed:false
+    showKey:{}, probed:false, embedOpen:false
   },
   upload:{
     tab:'research', researchName:'', researching:false, researchProgress:0,
@@ -1131,6 +1516,48 @@ async function friendlyHttp(res, who){
   return who+' returned '+res.status+(detail?': '+detail.slice(0,200):'');
 }
 
+/* ---------------- Ollama addressing ----------------
+   Ollama always lives on the user's own machine, but the name it
+   answers to varies: localhost resolves to ::1 on some systems and
+   127.0.0.1 on others, and a host page may pin a LAN address. We try
+   the configured address first, then the usual suspects, and remember
+   whichever one replied. */
+const OLLAMA_FALLBACKS = ['http://localhost:11434','http://127.0.0.1:11434','http://[::1]:11434'];
+function tidyBase(u){ return String(u||'').trim().replace(/\/+$/,''); }
+function ollamaBases(){
+  const out=[];
+  const push=u=>{ u=tidyBase(u); if(u && out.indexOf(u)<0) out.push(u); };
+  push(S.ai.ollamaUrl);
+  OLLAMA_FALLBACKS.forEach(push);
+  return out;
+}
+/** Remember the address that answered so later calls go straight there. */
+function noteOllamaBase(base){
+  if(tidyBase(S.ai.ollamaUrl)!==base){ S.ai.ollamaUrl=base; saveLocalSoon(); }
+}
+/** Explain an Ollama connection failure in terms of where the app is running. */
+function ollamaHelp(base){
+  let msg='Cannot reach Ollama at '+base+'. Start it with OLLAMA_ORIGINS=* so this page is allowed to connect.';
+  if(EMBED.framed){
+    msg += EMBED.opaque
+      ? ' This app is running inside another app and the frame has no origin of its own, so Ollama sees the request as coming from "null" — OLLAMA_ORIGINS=* covers that, or add allow-same-origin to the iframe.'
+      : ' This app is running inside another app, so OLLAMA_ORIGINS must include '+EMBED.origin+' (or just use *).';
+    if(!EMBED.bridge) msg += ' A host bridge would also work: see AI setup.';
+  }
+  if(servedFromWeb())
+    msg += ' This page is served over https from '+EMBED.origin+'. Browsers guard calls from a public page '+
+           'into a private network, so the surest fix is to run this file from your own machine — save it and '+
+           'open it directly, or serve it from localhost. WebLLM and the cloud providers work either way.';
+  return msg;
+}
+/** True when the app is being served from a public https origin, e.g. GitHub Pages. */
+function servedFromWeb(){
+  try{
+    return location.protocol==='https:' &&
+      !/^(localhost|127\.0\.0\.1|\[::1\])$/.test(location.hostname);
+  }catch(e){ return false; }
+}
+
 /* ---------------- model listing ---------------- */
 const AI = {};
 
@@ -1140,10 +1567,17 @@ AI.listModels = async function(provider, force){
   try{
     let list=[];
     if(provider==='ollama'){
-      const base = (A.ollamaUrl||'').replace(/\/+$/,'');
-      const r = await fetch(base+'/api/tags');
-      if(!r.ok) throw new Error('Ollama answered '+r.status+'.');
-      const j = await r.json();
+      const bases=ollamaBases();
+      let j=null, hit='', httpErr='';
+      for(const base of bases){
+        try{
+          const r = await fetch(base+'/api/tags');
+          if(!r.ok){ httpErr='Ollama answered '+r.status+'.'; continue; }
+          j = await r.json(); hit=base; break;
+        }catch(e){ /* try the next address */ }
+      }
+      if(!j) throw new Error(httpErr || ollamaHelp(bases[0]));
+      noteOllamaBase(hit);
       list = (j.models||[]).map(m=>({ id:m.name, label:m.name,
         note: m.details?.parameter_size ? m.details.parameter_size : (m.size?fmtSize(m.size):'') }));
       A.ollamaUp = true;
@@ -1215,22 +1649,49 @@ function defaultModelFor(provider,list){
   return list[0].id;
 }
 
+/** Why WebGPU is missing — the answer is usually the iframe, not the browser. */
+function webgpuBlockedReason(){
+  if(EMBED.framed && EMBED.opaque)
+    return 'WebLLM needs WebGPU, and this frame has no origin of its own so WebGPU is switched off. '+
+           'Add allow-same-origin to the iframe sandbox attribute on the host page, or use Ollama, which works here.';
+  if(EMBED.framed && !EMBED.secure && EMBED.proto!=='file:')
+    return 'WebLLM needs WebGPU, which only runs in a secure context. Serve the host page over https, or use Ollama.';
+  return 'WebLLM needs WebGPU. Use Chrome or Edge 113+, or switch to Ollama.';
+}
+
 /* ---------------- WebLLM loader ---------------- */
 let _webllmMod=null;
+/* Several mirrors, because a host page's CSP often allows one CDN but not another. */
+const WEBLLM_SOURCES = [
+  'https://esm.run/@mlc-ai/web-llm',
+  'https://cdn.jsdelivr.net/npm/@mlc-ai/web-llm/+esm',
+  'https://unpkg.com/@mlc-ai/web-llm?module'
+];
 async function loadWebLLM(){
   if(_webllmMod) return _webllmMod;
-  try{
-    _webllmMod = await import('https://esm.run/@mlc-ai/web-llm');
-    return _webllmMod;
-  }catch(e){
-    throw new Error('WebLLM could not load. It needs one internet connection to fetch the runtime the first time.');
+  /* A host that already bundles WebLLM can simply hand the module over. */
+  try{ if(window.DV_WEBLLM){ _webllmMod=window.DV_WEBLLM; return _webllmMod; } }catch(e){}
+  try{ if(EMBED.sameOriginTop && window.top.DV_WEBLLM){ _webllmMod=window.top.DV_WEBLLM; return _webllmMod; } }catch(e){}
+
+  let last=null;
+  for(const src of WEBLLM_SOURCES){
+    try{ _webllmMod = await import(src); return _webllmMod; }
+    catch(e){ last=e; }
   }
+  let why='WebLLM could not load. It needs one internet connection to fetch the runtime the first time.';
+  if(EMBED.framed)
+    why += ' Running inside another app, a Content-Security-Policy on the host page can also block the download — '+
+           'allow script-src/connect-src for esm.run and jsdelivr, or set window.DV_WEBLLM on the host. '+
+           'Ollama and the cloud providers do not need this.';
+  const err=new Error(why);
+  err.cause=last;
+  throw err;
 }
 async function webllmEngine(){
   const A=S.ai, want=A.model.webllm;
   if(!want) throw new Error('Choose a WebLLM model in AI setup.');
   if(A.webllm.engine && A.webllm.loadedModel===want) return A.webllm.engine;
-  if(!navigator.gpu) throw new Error('WebLLM needs WebGPU. Use Chrome or Edge 113+, or switch to Ollama.');
+  if(!navigator.gpu) throw new Error(webgpuBlockedReason());
   const wl = await loadWebLLM();
   A.webllm.loading=true; A.webllm.progress=0; A.webllm.text='Preparing…';
   updateAIStatus();
@@ -1261,19 +1722,21 @@ AI._chatRaw = async function(messages, opts){
   const maxTokens   = opts.maxTokens||800;
 
   if(p==='ollama'){
-    const base=(A.ollamaUrl||'').replace(/\/+$/,'');
     const model=A.model.ollama;
     if(!model) throw new Error('Pick an Ollama model in AI setup.');
-    let r;
-    try{
-      r = await fetch(base+'/api/chat',{
-        method:'POST', headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({ model, messages, stream:false,
-          options:{ temperature, num_predict:maxTokens } })
-      });
-    }catch(e){
-      throw new Error('Cannot reach Ollama at '+base+'. Start it, then set OLLAMA_ORIGINS=* so this page may connect.');
+    const bases=ollamaBases();
+    const payload=JSON.stringify({ model, messages, stream:false,
+      options:{ temperature, num_predict:maxTokens } });
+    let r=null, hit='';
+    for(const base of bases){
+      try{
+        r = await fetch(base+'/api/chat',{
+          method:'POST', headers:{'Content-Type':'application/json'}, body:payload });
+        hit=base; break;
+      }catch(e){ /* try the next address */ }
     }
+    if(!r) throw new Error(ollamaHelp(bases[0]));
+    noteOllamaBase(hit);
     if(!r.ok) throw new Error(await friendlyHttp(r,'Ollama'));
     const j=await r.json();
     return (j.message&&j.message.content||'').trim();
@@ -1570,23 +2033,24 @@ AI.currentLabel = function(){
 
 /** Probe Ollama once at startup so the default provider is honest. */
 async function probeOllama(){
-  const base=(S.ai.ollamaUrl||'').replace(/\/+$/,'');
-  try{
-    const ctl=new AbortController();
-    const t=setTimeout(()=>ctl.abort(),2500);
-    const r=await fetch(base+'/api/tags',{signal:ctl.signal});
-    clearTimeout(t);
-    if(!r.ok) throw new Error();
-    const j=await r.json();
-    S.ai.models.ollama=(j.models||[]).map(m=>({id:m.name,label:m.name,
-      note:m.details?.parameter_size||''}));
-    S.ai.ollamaUp = true;
-    if(!S.ai.model.ollama && S.ai.models.ollama.length) S.ai.model.ollama=S.ai.models.ollama[0].id;
-    return true;
-  }catch(e){
-    S.ai.ollamaUp=false;
-    return false;
+  for(const base of ollamaBases()){
+    try{
+      const ctl=new AbortController();
+      const t=setTimeout(()=>ctl.abort(),2500);
+      const r=await fetch(base+'/api/tags',{signal:ctl.signal});
+      clearTimeout(t);
+      if(!r.ok) continue;
+      const j=await r.json();
+      noteOllamaBase(base);
+      S.ai.models.ollama=(j.models||[]).map(m=>({id:m.name,label:m.name,
+        note:m.details?.parameter_size||''}));
+      S.ai.ollamaUp = true;
+      if(!S.ai.model.ollama && S.ai.models.ollama.length) S.ai.model.ollama=S.ai.models.ollama[0].id;
+      return true;
+    }catch(e){ /* try the next address */ }
   }
+  S.ai.ollamaUp=false;
+  return false;
 }
 
 /** Probe WebLLM: needs WebGPU, a real adapter, and the runtime module. */
@@ -2927,7 +3391,8 @@ function renderModals(){
     S.modal==='key'     ? ModalKey() :
     S.modal==='privacy' ? ModalPrivacy() :
     S.modal==='share'   ? ModalShare() :
-    S.modal==='library' ? ModalLibrary() : '';
+    S.modal==='library' ? ModalLibrary() :
+    S.modal==='hostbridge' ? ModalHostBridge() : '';
   const first=$('#modals .modal');
   if(first) first.focus();
 }
@@ -2988,6 +3453,57 @@ function ModalKey(){
 }
 
 /** A small readout of the local-first ladder, plus a one-click cloud fallback. */
+/** Fallback when the clipboard is blocked in this frame: show the snippet to copy by hand. */
+function ModalHostBridge(){
+  return '<div class="overlay" data-act="closeModalBg"><div class="modal wide" tabindex="-1">'+
+    '<div class="modal-head"><div class="row gap-3">'+
+      '<span style="color:var(--blue-600)">'+I('cpu',24)+'</span>'+
+      '<h2 style="font-size:1.125rem;font-weight:700">Host bridge</h2></div>'+
+      '<button class="icon-btn ib-gray" data-act="closeModal">'+I('x',20)+'</button></div>'+
+    '<div class="modal-body">'+
+      '<p class="small muted mb-4">Paste this into the page that holds this frame, then reopen AI setup and '+
+      'choose <b>Re-test connection</b>. The host will make the calls this frame is not allowed to make, '+
+      'so Ollama and the cloud providers both keep working.</p>'+
+      '<textarea class="input" readonly rows="16" style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.75rem;white-space:pre" '+
+        'onclick="this.select()">'+esc(HOST_BRIDGE_SNIPPET)+'</textarea>'+
+      '<p class="tiny muted mt-2">Edit the ALLOW list if your Ollama runs on a different address, and put your shared '+
+      'keys in CONFIG if this frame has no storage of its own.</p>'+
+      '<div class="between mt-6" style="gap:.75rem">'+
+        '<button class="btn btn-sm" style="color:var(--gray-600)" data-act="openAI">Back to AI setup</button>'+
+        '<button class="btn btn-amber btn-sm" data-act="closeModal">Done</button>'+
+      '</div>'+
+    '</div>'+
+  '</div></div>';
+}
+
+/** Shown only when the app is running as a window inside another app. */
+function embedPanel(){
+  const rep=embedReport();
+  if(!rep.framed) return '';
+  const open = S.ai.embedOpen ? ' open' : '';
+  const tone = rep.problems.length ? 'amber' : 'gray';
+  const rows = rep.problems.map(p=>
+      '<li style="margin-bottom:.5rem"><b>'+esc(p.what)+'</b><br>'+
+      '<span class="muted">'+esc(p.why)+'</span><br>'+
+      '<span>Fix: '+esc(p.fix)+'</span></li>').join('')
+    + rep.notes.map(n=>'<li style="margin-bottom:.35rem" class="muted">'+esc(n)+'</li>').join('');
+
+  return '<details class="note note-'+tone+' mb-4" style="padding:.75rem 1rem"'+open+'>'+
+    '<summary style="cursor:pointer;font-weight:600;font-size:.8125rem" data-act="toggleEmbed">'+
+      'Running inside another app'+
+      (rep.problems.length ? ' \u2014 '+rep.problems.length+' thing'+(rep.problems.length===1?'':'s')+' to fix'
+                           : ' \u2014 everything is available')+
+    '</summary>'+
+    '<ul class="tiny" style="margin:.75rem 0 0;padding-left:1.1rem">'+rows+'</ul>'+
+    '<div class="field-row mt-3">'+
+      '<button class="btn btn-blue btn-sm flex1" data-act="copyHostBridge">Copy host bridge</button>'+
+      '<button class="btn btn-sm flex1" data-act="retryEmbed">Re-test connection</button>'+
+    '</div>'+
+    '<p class="tiny muted mt-2">The bridge is a short listener you paste into the page that holds this frame. '+
+      'It lets the host make the calls this frame is not allowed to make, so Ollama keeps working.</p>'+
+  '</details>';
+}
+
 function ladderPanel(){
   const A=S.ai;
   const mark = st => st===true ? '<span class="badge">found</span>'
@@ -3035,7 +3551,14 @@ function ModalAI(){
           ? 'Connected. '+list.length+' model'+(list.length===1?'':'s')+' available on this machine.'
           : 'Not connected yet. Install Ollama, run <code>ollama pull llama3.2</code>, then start it with '+
             '<code>OLLAMA_ORIGINS=* ollama serve</code> so this page is allowed to talk to it.')+
-      '</p></div>';
+      '</p></div>'+
+      (servedFromWeb() && !A.ollamaUp
+        ? '<div class="note note-blue" style="padding:.75rem 1rem"><p class="tiny">'+
+          'This copy is being served over the web from <code>'+esc(EMBED.origin)+'</code>. Browsers restrict calls '+
+          'from a public page into your private network, so Ollama may stay out of reach here even while it is running. '+
+          'Download this file and open it from your own machine and Ollama works normally. '+
+          'WebLLM and the cloud providers are unaffected.</p></div>'
+        : '');
   }
   else if(p==='webllm'){
     const gpu = !!navigator.gpu;
@@ -3090,6 +3613,7 @@ function ModalAI(){
     '</div>'+
 
     ladderPanel()+
+    embedPanel()+
 
     '<div class="prov-grid mb-4">'+PROVIDER_ORDER.map(id=>{
       const m=PROVIDERS[id];
@@ -3345,6 +3869,27 @@ reset(){
   window.scrollTo(0,0); render();
 },
 dismissDisclaimer(){ sessionStorage.setItem('hfchat.disclaimer','1'); S.disclaimer=false; render(); },
+
+/* ---- embedded-in-another-app panel ---- */
+toggleEmbed(){ S.ai.embedOpen=!S.ai.embedOpen; renderModals(); },
+async copyHostBridge(){
+  try{
+    await navigator.clipboard.writeText(HOST_BRIDGE_SNIPPET);
+    toast('Host bridge copied. Paste it into the page that holds this frame.','ok',5000);
+  }catch(e){
+    // Clipboard access is often denied inside a frame; show it instead.
+    openModal('hostbridge');
+  }
+},
+async retryEmbed(){
+  toast('Re-testing the connection\u2026','',1600);
+  await HOST.waitReady(1200);
+  S.ai.probed=false; S.ai.pinned=false;
+  await autoSelectProvider();
+  try{ await AI.listModels(S.ai.provider,true); }catch(e){}
+  S.ai.probed=true;
+  updateAIStatus(); renderModals(); saveLocalSoon();
+},
 openPrivacy(){ openModal('privacy'); },
 openAI(){ openModal('ai'); },
 openLibrary(){ openModal('library'); },
@@ -3791,12 +4336,18 @@ async browseImage(el){
 async startCam(el){
   const slot=el.dataset.slot;
   try{
+    if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia)
+      throw new Error(EMBED.framed
+        ? 'The camera is not available inside this frame. The host page needs allow="camera" on the iframe.'
+        : 'This browser has no camera API. A secure page (https or file://) is required.');
     const stream=await navigator.mediaDevices.getUserMedia({ video:{ facingMode:'user',
       width:{ideal:1280}, height:{ideal:720} }});
     S.creator.camera={ open:slot, stream };
     render();
   }catch(err){
-    toast('Unable to access camera. Check that permission is granted.','err',5000);
+    toast(err && /frame|camera API/.test(err.message||'')
+      ? err.message
+      : 'Unable to access camera. Check that permission is granted.','err',6000);
   }
 },
 stopCam(){ stopCamera(); render(); },
@@ -4259,8 +4810,24 @@ window.addEventListener('beforeunload', ()=>{ saveLocal(); stopCamera(); });
    23. Boot
    --------------------------------------------------------------- */
 async function boot(){
+  _appReady=true;
+  // Say hello to the host early, so a bridge is ready before the first probe.
+  if(EMBED.framed) HOST.hello();
+
   loadLibrary();
   restoreLocal();
+
+  // A host can pin the Ollama address, the provider or the model on the URL:
+  //   index.html#ollama=http://192.168.1.20:11434&provider=ollama
+  const pOllama=embedParam('ollama'), pProv=embedParam('provider'), pModel=embedParam('model');
+  if(pOllama) S.ai.ollamaUrl=tidyBase(pOllama);
+  if(pProv && PROVIDERS[pProv]){ S.ai.provider=pProv; S.ai.pinned=true; }
+  if(pModel && PROVIDERS[S.ai.provider]) S.ai.model[S.ai.provider]=pModel;
+
+  // Anything the host pushed down before the app finished loading.
+  if(_pendingHostConfig){ const c=_pendingHostConfig; _pendingHostConfig=null; applyHostConfig(c); }
+  HOST.inbox.splice(0).forEach(applyHostConfig);
+
   // The shared vault is the source of truth for keys, ahead of any saved session.
   KeyVault.hydrate(S.ai.keys);
   try{ const mt=localStorage.getItem('hfchat.manualText'); if(mt && !S.upload.manualText) S.upload.manualText=mt; }catch(e){}
