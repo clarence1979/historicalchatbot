@@ -641,8 +641,11 @@ video.cam{width:100%;height:20rem;object-fit:cover;background:#000;border-radius
      <iframe src="index.html"
              sandbox="allow-scripts allow-same-origin allow-downloads
                       allow-popups allow-forms allow-modals"
-             allow="camera; microphone; clipboard-write">
+             allow="camera; microphone; clipboard-write; local-network-access">
      </iframe>
+
+   local-network-access is what lets the frame reach Ollama on the user's
+   own machine under Chromium 142+. Every frame in the chain needs it.
 
    and paste the bridge listener printed by AI setup -> "Running
    inside another app" -> "Copy host bridge" into the host page.
@@ -1291,7 +1294,7 @@ const S = {
     chain:'',              // which rung of the fallback ladder we landed on
     chainNote:'',          // plain-language reason, shown in AI setup
     webllm:{ engine:null, loadedModel:'', loading:false, progress:0, text:'' },
-    showKey:{}, probed:false, embedOpen:false
+    showKey:{}, probed:false, embedOpen:false, lna:'unknown'
   },
   upload:{
     tab:'research', researchName:'', researching:false, researchProgress:0,
@@ -1535,20 +1538,45 @@ function ollamaBases(){
 function noteOllamaBase(base){
   if(tidyBase(S.ai.ollamaUrl)!==base){ S.ai.ollamaUrl=base; saveLocalSoon(); }
 }
+/**
+ * Chromium 142+ enforces Local Network Access: a page on a public origin may not
+ * reach localhost until the user allows it. Annotating the request with
+ * targetAddressSpace tells the browser up front where it is going, which both
+ * exempts it from the mixed-content rule and raises the permission prompt
+ * instead of failing silently. Older browsers ignore the option.
+ */
+function localFetch(url, init){
+  const opts = Object.assign({}, init||{});
+  opts.targetAddressSpace = 'local';
+  return fetch(url, opts);
+}
+/** granted | prompt | denied | unknown — the permission names changed in Chrome 145. */
+async function lnaState(){
+  if(!navigator.permissions || !navigator.permissions.query) return 'unknown';
+  for(const name of ['local-network-access','loopback-network','local-network']){
+    try{
+      const st = await navigator.permissions.query({ name });
+      if(st && st.state) return st.state;
+    }catch(e){ /* this engine does not know that name */ }
+  }
+  return 'unknown';
+}
+
 /** Explain an Ollama connection failure in terms of where the app is running. */
 function ollamaHelp(base){
-  let msg='Cannot reach Ollama at '+base+'. Start it with OLLAMA_ORIGINS=* so this page is allowed to connect.';
-  if(EMBED.framed){
-    msg += EMBED.opaque
-      ? ' This app is running inside another app and the frame has no origin of its own, so Ollama sees the request as coming from "null" — OLLAMA_ORIGINS=* covers that, or add allow-same-origin to the iframe.'
-      : ' This app is running inside another app, so OLLAMA_ORIGINS must include '+EMBED.origin+' (or just use *).';
-    if(!EMBED.bridge) msg += ' A host bridge would also work: see AI setup.';
-  }
   if(servedFromWeb())
-    msg += ' This page is served over https from '+EMBED.origin+'. Browsers guard calls from a public page '+
-           'into a private network, so the surest fix is to run this file from your own machine — save it and '+
-           'open it directly, or serve it from localhost. WebLLM and the cloud providers work either way.';
-  return msg;
+    return 'Cannot reach Ollama at '+base+'. This page is hosted on the web, so the browser blocks it from '+
+           'reaching your own machine until you say yes. Open AI setup for the two-step fix \u2014 it takes a minute, '+
+           'and only has to be done once per browser.';
+  if(EMBED.framed && EMBED.opaque)
+    return 'Cannot reach Ollama at '+base+'. This app is running inside another app in a frame with no origin of '+
+           'its own, so Ollama sees the request coming from "null". Start Ollama with OLLAMA_ORIGINS=*, or ask the '+
+           'host page to add allow-same-origin to the iframe.';
+  if(EMBED.framed)
+    return 'Cannot reach Ollama at '+base+'. Start Ollama with OLLAMA_ORIGINS='+EMBED.origin+' (or just *), since '+
+           'this app is running inside another app. See AI setup if that does not do it.';
+  return 'Cannot reach Ollama at '+base+'. Check that it is running, and start it with OLLAMA_ORIGINS=* so this '+
+         'page is allowed to connect.';
 }
 /** True when the app is being served from a public https origin, e.g. GitHub Pages. */
 function servedFromWeb(){
@@ -1571,7 +1599,7 @@ AI.listModels = async function(provider, force){
       let j=null, hit='', httpErr='';
       for(const base of bases){
         try{
-          const r = await fetch(base+'/api/tags');
+          const r = await localFetch(base+'/api/tags');
           if(!r.ok){ httpErr='Ollama answered '+r.status+'.'; continue; }
           j = await r.json(); hit=base; break;
         }catch(e){ /* try the next address */ }
@@ -1730,7 +1758,7 @@ AI._chatRaw = async function(messages, opts){
     let r=null, hit='';
     for(const base of bases){
       try{
-        r = await fetch(base+'/api/chat',{
+        r = await localFetch(base+'/api/chat',{
           method:'POST', headers:{'Content-Type':'application/json'}, body:payload });
         hit=base; break;
       }catch(e){ /* try the next address */ }
@@ -2037,7 +2065,7 @@ async function probeOllama(){
     try{
       const ctl=new AbortController();
       const t=setTimeout(()=>ctl.abort(),2500);
-      const r=await fetch(base+'/api/tags',{signal:ctl.signal});
+      const r=await localFetch(base+'/api/tags',{signal:ctl.signal});
       clearTimeout(t);
       if(!r.ok) continue;
       const j=await r.json();
@@ -3476,6 +3504,42 @@ function ModalHostBridge(){
   '</div></div>';
 }
 
+/**
+ * Shown when the app is hosted on the web and Ollama is unreachable. Chromium 142+
+ * treats a call from a public page to localhost as a local network request and
+ * blocks it until the user grants permission, which is almost always the real cause.
+ */
+function lnaPanel(){
+  const st = S.ai.lna || 'unknown';
+  const badge = st==='granted' ? 'permission granted'
+              : st==='denied'  ? 'permission denied'
+              : st==='prompt'  ? 'permission not granted yet'
+              : '';
+  return '<div class="note note-blue" style="padding:.75rem 1rem">'+
+    '<p class="tiny" style="font-weight:600;margin:0 0 .5rem">Reaching Ollama from a hosted page'+
+      (badge?' \u2014 '+esc(badge):'')+'</p>'+
+    '<p class="tiny" style="margin:0 0 .5rem">This copy is served from <code>'+esc(EMBED.origin)+'</code>, '+
+      'so your browser will not let it talk to your own machine until you allow it. Two steps, once per browser:</p>'+
+    '<ol class="tiny" style="margin:0;padding-left:1.1rem">'+
+      '<li style="margin-bottom:.35rem">Start Ollama so it accepts this page:<br>'+
+        '<code>OLLAMA_ORIGINS='+esc(EMBED.origin&&EMBED.origin!=='null'?EMBED.origin:'*')+' ollama serve</code>'+
+        ' &nbsp;(or just <code>OLLAMA_ORIGINS=*</code>)</li>'+
+      '<li style="margin-bottom:.35rem">Press <b>Allow local network access</b> below, then choose <b>Allow</b> in the '+
+        'browser prompt. If no prompt appears, click the icon at the left of the address bar, find '+
+        '<b>Local network access</b>, and switch it on.</li>'+
+    '</ol>'+
+    (EMBED.framed
+      ? '<p class="tiny" style="margin:.5rem 0 0">Because this app sits inside another app, every frame in the chain '+
+        'also needs <code>allow="local-network-access"</code> on its iframe tag.</p>'
+      : '')+
+    '<div class="field-row mt-3">'+
+      '<button class="btn btn-blue btn-sm flex1" data-act="grantLocalNetwork">Allow local network access</button>'+
+    '</div>'+
+    '<p class="tiny muted mt-2">Rather not bother? Download this file and open it from your own machine \u2014 Ollama '+
+      'then works with no permission at all. WebLLM and the cloud providers are unaffected either way.</p>'+
+  '</div>';
+}
+
 /** Shown only when the app is running as a window inside another app. */
 function embedPanel(){
   const rep=embedReport();
@@ -3551,14 +3615,7 @@ function ModalAI(){
           ? 'Connected. '+list.length+' model'+(list.length===1?'':'s')+' available on this machine.'
           : 'Not connected yet. Install Ollama, run <code>ollama pull llama3.2</code>, then start it with '+
             '<code>OLLAMA_ORIGINS=* ollama serve</code> so this page is allowed to talk to it.')+
-      '</p></div>'+
-      (servedFromWeb() && !A.ollamaUp
-        ? '<div class="note note-blue" style="padding:.75rem 1rem"><p class="tiny">'+
-          'This copy is being served over the web from <code>'+esc(EMBED.origin)+'</code>. Browsers restrict calls '+
-          'from a public page into your private network, so Ollama may stay out of reach here even while it is running. '+
-          'Download this file and open it from your own machine and Ollama works normally. '+
-          'WebLLM and the cloud providers are unaffected.</p></div>'
-        : '');
+      '</p></div>';
   }
   else if(p==='webllm'){
     const gpu = !!navigator.gpu;
@@ -3613,6 +3670,7 @@ function ModalAI(){
     '</div>'+
 
     ladderPanel()+
+    (servedFromWeb() && A.ollamaUp!==true ? lnaPanel() : '')+
     embedPanel()+
 
     '<div class="prov-grid mb-4">'+PROVIDER_ORDER.map(id=>{
@@ -3869,6 +3927,24 @@ reset(){
   window.scrollTo(0,0); render();
 },
 dismissDisclaimer(){ sessionStorage.setItem('hfchat.disclaimer','1'); S.disclaimer=false; render(); },
+
+/* ---- local network access ---- */
+async grantLocalNetwork(){
+  // The request itself is what raises the browser prompt; there is no API to ask directly.
+  toast('Asking the browser for permission\u2026','',2000);
+  const ok = await probeOllama();
+  S.ai.lna = await lnaState();
+  if(ok){
+    S.ai.provider='ollama'; S.ai.pinned=true;
+    try{ await AI.listModels('ollama',true); }catch(e){}
+    toast('Connected to Ollama.','ok',4000);
+  }else if(S.ai.lna==='denied'){
+    toast('Local network access is blocked for this site. Turn it on from the icon at the left of the address bar.','err',8000);
+  }else{
+    toast('Still no answer from Ollama. Check that it is running and started with OLLAMA_ORIGINS=*.','warn',8000);
+  }
+  updateAIStatus(); renderModals(); saveLocalSoon();
+},
 
 /* ---- embedded-in-another-app panel ---- */
 toggleEmbed(){ S.ai.embedOpen=!S.ai.embedOpen; renderModals(); },
@@ -4834,6 +4910,10 @@ async function boot(){
   initRecognition();
   systemVoices();
   render();
+
+  // Hosted on the web? Note whether the browser has already been told this site
+  // may reach the local machine, so AI setup can say so.
+  if(servedFromWeb()) lnaState().then(st=>{ S.ai.lna=st; });
 
   // Local first, cloud only if local cannot run: Ollama -> WebLLM -> OpenAI.
   if(!S.ai.probed){
