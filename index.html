@@ -336,11 +336,22 @@ input[type=range]{width:100%;accent-color:var(--amber-600)}
 input[type=checkbox],input[type=radio]{accent-color:var(--amber-600);width:1rem;height:1rem}
 
 /* ---------- modal ---------- */
-.overlay{position:fixed;inset:0;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;
+.overlay{position:fixed;inset:0;background:rgba(0,0,0,.55);display:flex;align-items:flex-start;justify-content:center;
   z-index:100;padding:1rem;overflow-y:auto}
-.modal{background:#fff;border-radius:1rem;box-shadow:var(--shadow-2xl);width:100%;max-width:32rem;padding:1.5rem;position:relative}
+.modal{background:#fff;border-radius:1rem;box-shadow:var(--shadow-2xl);width:100%;max-width:32rem;padding:1.5rem;
+  position:relative;margin:auto}
 .modal.wide{max-width:56rem;max-height:90vh;overflow-y:auto;padding:0;border-radius:.5rem}
 .modal.med{max-width:42rem}
+/* fit: header + scrolling body + footer, never taller than the viewport */
+.modal.fit{display:flex;flex-direction:column;padding:0;overflow:hidden;
+  max-height:calc(100vh - 2rem);max-height:calc(100dvh - 2rem)}
+.modal.fit .m-head{flex:0 0 auto;padding:.875rem 1.25rem;border-bottom:1px solid var(--gray-200)}
+.modal.fit .m-scroll{flex:1 1 auto;min-height:0;overflow-y:auto;overscroll-behavior:contain;padding:1rem 1.25rem}
+.modal.fit .m-foot{flex:0 0 auto;padding:.75rem 1.25rem;border-top:1px solid var(--gray-200);
+  background:var(--gray-50);border-radius:0 0 1rem 1rem}
+.modal.fit .modal-x{top:.75rem;right:.75rem}
+.modal.fit .kv{padding:.3rem 0}
+.modal.fit .note{padding:.625rem .875rem}
 .modal-x{position:absolute;top:1rem;right:1rem;padding:.375rem;color:var(--gray-400);border-radius:.5rem;display:inline-flex}
 .modal-x:hover{color:var(--gray-600);background:var(--gray-100)}
 .modal-head{position:sticky;top:0;background:#fff;border-bottom:1px solid var(--gray-200);padding:1rem 1.5rem;
@@ -364,11 +375,19 @@ input[type=checkbox],input[type=radio]{accent-color:var(--amber-600);width:1rem;
 /* ---------- AI setup ---------- */
 .prov-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:.5rem}
 @media(min-width:640px){.prov-grid{grid-template-columns:repeat(3,1fr)}}
-.prov{border:2px solid var(--gray-200);border-radius:.625rem;padding:.75rem;text-align:left;transition:all .18s;background:#fff}
+.prov{border:2px solid var(--gray-200);border-radius:.625rem;padding:.5rem .625rem;text-align:left;transition:all .18s;background:#fff}
 .prov:hover{border-color:var(--amber-300);background:var(--amber-50)}
 .prov.on{border-color:var(--amber-500);background:var(--amber-50);box-shadow:var(--shadow-md)}
 .prov .nm{font-weight:600;font-size:.875rem;color:var(--gray-900);display:flex;align-items:center;gap:.375rem}
-.prov .ds{font-size:.6875rem;color:var(--gray-500);margin-top:.125rem}
+.prov .ds{font-size:.6875rem;color:var(--gray-500)}
+.prov-b{display:flex;align-items:center;justify-content:space-between;gap:.25rem .375rem;flex-wrap:wrap;margin-top:.125rem}
+/* AI setup: side-by-side on wide screens so the panel stays short */
+.ai-cols{display:grid;gap:1rem;grid-template-columns:1fr;align-items:start}
+@media(min-width:860px){
+  .modal.ai{max-width:48rem}
+  .ai-cols{grid-template-columns:1fr 1fr;gap:1.25rem}
+  .ai-cols .prov-grid{grid-template-columns:repeat(2,1fr)}
+}
 .badge{display:inline-block;font-size:.625rem;font-weight:700;letter-spacing:.04em;text-transform:uppercase;
   padding:.125rem .375rem;border-radius:.25rem;background:var(--green-100);color:var(--green-800)}
 .badge.gray{background:var(--gray-200);color:var(--gray-600)}
@@ -3000,7 +3019,7 @@ function ladderPanel(){
     ? '<span class="badge gray">running, no models</span>'
     : mark(A.ollamaUp);
 
-  return '<div class="note note-'+(A.pinned?'blue':(A.chain==='openai'?'amber':'gray'))+' mb-4" style="padding:.75rem 1rem">'+
+  return '<div class="note note-'+(A.pinned?'blue':(A.chain==='openai'?'amber':'gray'))+'" style="padding:.75rem 1rem">'+
     '<div class="kv"><span>1 &middot; Ollama <span class="muted2">local server</span></span><b>'+ollamaState+'</b></div>'+
     '<div class="kv"><span>2 &middot; WebLLM <span class="muted2">in this tab</span></span><b>'+mark(A.webllmUp)+'</b></div>'+
     '<div class="kv"><span>3 &middot; OpenAI <span class="muted2">cloud, needs a key</span></span><b>'+keyState+'</b></div>'+
@@ -3081,36 +3100,45 @@ function ModalAI(){
          :'Add a key, then fetch the list to see every model your account can use right now.')+'</p></div>')+
     '</div>';
 
-  return '<div class="overlay" data-act="closeModalBg"><div class="modal med" tabindex="-1">'+
-    '<button class="modal-x" data-act="closeModal">'+I('x',20)+'</button>'+
-    '<div class="row mb-4" style="gap:.75rem">'+
-      '<span style="background:var(--amber-100);color:var(--amber-600);padding:.625rem;border-radius:.75rem;display:inline-flex">'+I('cpu',20)+'</span>'+
-      '<div><h2 style="font-size:1.125rem;font-weight:700">AI setup</h2>'+
-      '<p class="small muted">Local first: Ollama, then WebLLM, then OpenAI. Local options need no key.</p></div>'+
-    '</div>'+
-
-    ladderPanel()+
-
-    '<div class="prov-grid mb-4">'+PROVIDER_ORDER.map(id=>{
+  const provGrid = '<div class="prov-grid">'+PROVIDER_ORDER.map(id=>{
       const m=PROVIDERS[id];
       const ready = m.needsKey ? !!A.keys[id] : (id==='ollama' ? A.ollamaUp===true : true);
       return '<button class="prov'+(p===id?' on':'')+'" data-act="setProvider" data-p="'+id+'">'+
         '<div class="nm">'+I(m.icon,14)+esc(m.name)+'</div>'+
-        '<div class="ds">'+esc(m.tag)+'</div>'+
-        '<div class="mt-2"><span class="badge'+(ready?'':' gray')+'">'+(ready?'ready':(m.needsKey?'key needed':'set up'))+'</span></div>'+
+        '<div class="prov-b"><span class="ds">'+esc(m.tag)+'</span>'+
+          '<span class="badge'+(ready?'':' gray')+'">'+(ready?'ready':(m.needsKey?'key needed':'set up'))+'</span></div>'+
       '</button>';
-    }).join('')+'</div>'+
+    }).join('')+'</div>';
 
-    '<p class="small muted2 mb-4">'+esc(meta.blurb)+'</p>'+
-    '<div class="stack gap-4">'+body+modelSelect+'</div>'+
-
-    (err?'<div class="note note-red mt-4"><p class="tiny">'+esc(err)+'</p></div>':'')+
-
-    '<div class="note note-gray mt-4"><div class="kv"><span>Chat</span><b>'+esc(PROVIDERS[p].name)+'</b></div>'+
+  const statusNote =
+    '<div class="note note-gray"><div class="kv"><span>Chat</span><b>'+esc(PROVIDERS[p].name)+'</b></div>'+
       '<div class="kv"><span>Pictures</span><b>'+(meta.canImage&&(!meta.needsKey||A.keys[p])?'available':'not on this provider')+'</b></div>'+
-      '<div class="kv"><span>Speech</span><b>'+((p==='openai'&&A.keys.openai)?'OpenAI voices':'browser voices')+'</b></div></div>'+
+      '<div class="kv"><span>Speech</span><b>'+((p==='openai'&&A.keys.openai)?'OpenAI voices':'browser voices')+'</b></div></div>';
 
-    '<div class="between mt-6" style="gap:.75rem">'+
+  return '<div class="overlay" data-act="closeModalBg"><div class="modal med ai fit" tabindex="-1">'+
+
+    '<div class="m-head">'+
+      '<button class="modal-x" data-act="closeModal">'+I('x',20)+'</button>'+
+      '<div class="row" style="gap:.75rem;padding-right:1.75rem">'+
+        '<span style="background:var(--amber-100);color:var(--amber-600);padding:.5rem;border-radius:.75rem;display:inline-flex">'+I('cpu',20)+'</span>'+
+        '<div><h2 style="font-size:1.125rem;font-weight:700">AI setup</h2>'+
+        '<p class="tiny muted">Local first: Ollama, then WebLLM, then OpenAI. Local options need no key.</p></div>'+
+      '</div>'+
+    '</div>'+
+
+    '<div class="m-scroll">'+
+      '<div class="ai-cols">'+
+        '<div class="stack gap-3">'+ladderPanel()+provGrid+'</div>'+
+        '<div class="stack gap-3">'+
+          '<p class="small muted2">'+esc(meta.blurb)+'</p>'+
+          '<div class="stack gap-3">'+body+modelSelect+'</div>'+
+          (err?'<div class="note note-red"><p class="tiny">'+esc(err)+'</p></div>':'')+
+          statusNote+
+        '</div>'+
+      '</div>'+
+    '</div>'+
+
+    '<div class="m-foot between" style="gap:.75rem">'+
       '<button class="btn btn-sm" style="color:var(--gray-600)" data-act="forgetKeys">Forget saved keys</button>'+
       '<button class="btn btn-amber btn-sm" data-act="closeModal">Done</button>'+
     '</div>'+
